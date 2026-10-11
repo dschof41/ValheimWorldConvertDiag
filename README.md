@@ -20,6 +20,21 @@ The same world loaded correctly on the previous Valheim version, including backu
 
 The problem turned out to be one malformed legacy container inventory.
 
+Since 1.3.0 the plugin also covers a second conversion failure with a different trace:
+
+```text
+System.FormatException: The input is not a valid Base-64 string
+
+at System.Convert.FromBase64String
+at ZPackage..ctor
+at ZDOMan.ConvertContainers
+
+World load failed mid-file. Exiting without save. Check backups!
+```
+
+Both failures come from one bad legacy container, but they break in different places. See
+[Two separate failure paths](#two-separate-failure-paths).
+
 ## What this plugin does
 
 ValheimWorldConvertDiag patches the legacy world inventory conversion process and logs the inventory and ZDO being processed when conversion fails.
@@ -41,9 +56,27 @@ It records details such as:
 - source ZDO world position
 - source prefab hash
 
+It also checks every container's stored `items` string before `ZDOMan.ConvertContainers` runs, and
+reports each one that is not valid Base-64 along with its ZDO UID, prefab hash and world position.
+
 The most useful part is the ZDO position.
 
 Instead of manually opening hundreds of chests, you can use the logged coordinates to find the exact world object causing the conversion failure.
+
+## Two separate failure paths
+
+Valheim 1.0 converts legacy containers in two stages, and a malformed container can break either one.
+
+| Stage | Exception | Covered by |
+|---|---|---|
+| `ZDOMan.ConvertInventories` rebuilding an inventory | `NullReferenceException` in `ItemDrop+ItemData.IsSameType` | the inventory patches, since 1.0.0 |
+| `ZDOMan.ConvertContainers` Base-64 decoding an `items` string | `FormatException` in `ZPackage..ctor` | the container pre-scan, since 1.3.0 |
+
+The second one aborts the load before any inventory is rebuilt, so the inventory patches never run and
+log nothing useful. The pre-scan walks the same ZDO list first, so the bad container is reported either way.
+
+Check which exception your log shows before reading the rest of this document. The recovery steps are the
+same for both.
 
 ## Important
 
@@ -472,6 +505,11 @@ Possible causes include:
 
 The neighboring containers in the confirmed case were built at the same time and were unaffected, so this does not appear to be tied simply to container age or the game version in which the chest was created.
 
+In the Base-64 variant the damage is in the serialized string itself rather than in the slot data. The
+confirmed case was a 312 character `items` string holding a replacement character (`U+FFFD`) at index 164,
+which suggests a byte was corrupted and re-encoded as invalid UTF-8 at some earlier point. The old build
+decoded what it could and loaded the chest anyway; 1.0 rejects the whole string, and with it the world.
+
 ## Troubleshooting
 
 ### The plugin does not create a log
@@ -502,6 +540,17 @@ Possible explanations include:
 
 Search the immediate area rather than assuming it must be a normal chest.
 
+### The reported Y coordinate is around 5000
+
+The object is inside a dungeon interior. Valheim builds cave and crypt interiors several thousand metres
+above the world, at the same X and Z as their entrance, so `goto X Z` lands you on the surface next to the
+entrance rather than at the object.
+
+Walk in through the entrance and look for the container inside. Flying up to the reported altitude puts you
+outside the interior, where the only thing you will find is its exit door.
+
+`goto` takes two arguments, X and Z. It ignores a third, so a Y value cannot be passed to it.
+
 ### Conversion succeeds after fixing one object but fails again
 
 That means there may be multiple malformed inventories.
@@ -519,6 +568,15 @@ Initial development and successful recovery were performed on:
 - BepInEx 5.x
 - Docker-hosted Valheim server
 - Windows Docker host
+
+The `ConvertContainers` coverage in 1.3.0 was developed and verified on:
+
+- Valheim 1.0.17 dedicated server
+- legacy world created before 1.0, 1.15 million ZDOs
+- vanilla world
+- BepInEx 5.4.23.5 (BepInExPack Valheim 5.4.2350)
+- `lloesche/valheim-server` Docker image
+- Linux Docker host (Ubuntu)
 
 The same diagnostic approach should apply anywhere the same Valheim world conversion code is used.
 

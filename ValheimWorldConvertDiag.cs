@@ -16,7 +16,7 @@ namespace ValheimWorldConvertDiag
     {
         public const string PluginGuid = "sonicdm.valheimworldconvertdiag";
         public const string PluginName = "Valheim World Convert Diagnostic";
-        public const string PluginVersion = "1.2.0";
+        public const string PluginVersion = "1.3.0";
 
         internal static ManualLogSource Log;
         internal static readonly object Sync = new object();
@@ -29,6 +29,11 @@ namespace ValheimWorldConvertDiag
         internal static string LastComparison = "<none>";
         internal static readonly Queue<string> RecentNamedItems = new Queue<string>();
         internal static string DiagnosticFile;
+        internal static bool InContainerConversion;
+
+        private static MethodInfo _zdoGetStringByHash;
+        private static MethodInfo _zdoGetPosition;
+        private static readonly int ItemsHash = StableHash("items");
 
         private Harmony _harmony;
 
@@ -45,7 +50,7 @@ namespace ValheimWorldConvertDiag
                 _harmony = new Harmony(PluginGuid);
                 PatchRequiredMethods(_harmony);
                 Write("Diagnostic patches installed successfully.");
-                Write("Waiting for ZDOMan.ConvertInventories(). No world data is modified by this plugin.");
+                Write("Waiting for ZDOMan.ConvertInventories() and ZDOMan.ConvertContainers(). No world data is modified by this plugin.");
             }
             catch (Exception ex)
             {
@@ -78,10 +83,40 @@ namespace ValheimWorldConvertDiag
             if (itemData == null) throw new TypeLoadException("Could not find Valheim type ItemDrop+ItemData");
             if (zdo == null) throw new TypeLoadException("Could not find Valheim type ZDO");
 
+            Type zpackage = FindType("ZPackage");
+            if (zpackage == null) throw new TypeLoadException("Could not find Valheim type ZPackage");
+
             MethodInfo convertInventories = zdoMan.GetMethods(AllMethods)
                 .FirstOrDefault(m => m.Name == "ConvertInventories");
             if (convertInventories == null)
                 throw new MissingMethodException("Could not find ZDOMan.ConvertInventories");
+
+            MethodInfo convertContainers = zdoMan.GetMethods(AllMethods)
+                .FirstOrDefault(m => m.Name == "ConvertContainers");
+            if (convertContainers == null)
+                throw new MissingMethodException("Could not find ZDOMan.ConvertContainers");
+
+            ConstructorInfo zpackageFromBase64 = zpackage.GetConstructors(AllMethods)
+                .FirstOrDefault(c =>
+                {
+                    ParameterInfo[] p = c.GetParameters();
+                    return p.Length == 1 && p[0].ParameterType == typeof(string);
+                });
+            if (zpackageFromBase64 == null)
+                throw new MissingMethodException("Could not find ZPackage(string)");
+
+            _zdoGetStringByHash = zdo.GetMethods(AllMethods)
+                .FirstOrDefault(m =>
+                {
+                    if (m.Name != "GetString") return false;
+                    ParameterInfo[] p = m.GetParameters();
+                    return p.Length == 2 && p[0].ParameterType == typeof(int) && p[1].ParameterType == typeof(string);
+                });
+            if (_zdoGetStringByHash == null)
+                throw new MissingMethodException("Could not find ZDO.GetString(int, string)");
+
+            _zdoGetPosition = zdo.GetMethods(AllMethods)
+                .FirstOrDefault(m => m.Name == "GetPosition" && m.GetParameters().Length == 0);
 
             MethodInfo loadOld = inventory.GetMethods(AllMethods)
                 .FirstOrDefault(m => m.Name == "LoadOld");
@@ -138,6 +173,15 @@ namespace ValheimWorldConvertDiag
                 prefix: new HarmonyMethod(typeof(ValheimWorldConvertDiagPlugin), nameof(InventoryLoadOldPrefix)),
                 finalizer: new HarmonyMethod(typeof(ValheimWorldConvertDiagPlugin), nameof(InventoryLoadOldFinalizer)));
 
+            harmony.Patch(
+                convertContainers,
+                prefix: new HarmonyMethod(typeof(ValheimWorldConvertDiagPlugin), nameof(ConvertContainersPrefix)),
+                finalizer: new HarmonyMethod(typeof(ValheimWorldConvertDiagPlugin), nameof(ConvertContainersFinalizer)));
+
+            harmony.Patch(
+                zpackageFromBase64,
+                prefix: new HarmonyMethod(typeof(ValheimWorldConvertDiagPlugin), nameof(ZPackageFromBase64Prefix)));
+
             foreach (MethodInfo method in addItemStringMethods)
             {
                 harmony.Patch(method,
@@ -162,7 +206,7 @@ namespace ValheimWorldConvertDiag
                     prefix: new HarmonyMethod(typeof(ValheimWorldConvertDiagPlugin), nameof(ZdoInventoryGetterPrefix)));
             }
 
-            Write($"Patched: ConvertInventories=1, LoadOld=1, AddItem(string)={addItemStringMethods.Count}, AddTempItem={addTempItemMethods.Count}, IsSameType={isSameTypeMethods.Count}, ZDO inventory getters={zdoInventoryGetterMethods.Count}");
+            Write($"Patched: ConvertInventories=1, LoadOld=1, AddItem(string)={addItemStringMethods.Count}, AddTempItem={addTempItemMethods.Count}, IsSameType={isSameTypeMethods.Count}, ZDO inventory getters={zdoInventoryGetterMethods.Count}, ConvertContainers=1, ZPackage(string)=1");
         }
 
         public static void ConvertInventoriesPrefix(MethodBase __originalMethod, object[] __args)
@@ -207,6 +251,219 @@ namespace ValheimWorldConvertDiag
             });
 
             return __exception;
+        }
+
+        // Legacy container conversion is a second, separate failure path. ConvertContainers feeds
+        // each container ZDO's "items" string into ZPackage(string), which Base-64 decodes it. One
+        // malformed string aborts the whole world load with a FormatException, and none of the
+        // inventory patches above ever run, so nothing identifies the object. Before the game gets
+        // there, walk the same ZDO list and report every "items" string that is not valid Base-64.
+        public static void ConvertContainersPrefix(object[] __args)
+        {
+            SafeDiagnostic(() =>
+            {
+                InContainerConversion = true;
+                Write("=== LEGACY WORLD CONTAINER CONVERSION STARTED ===");
+
+                IEnumerable zdos = (__args != null && __args.Length > 0) ? __args[0] as IEnumerable : null;
+                if (zdos == null)
+                {
+                    Write("Could not read the ZDO list argument; container pre-scan skipped.");
+                    return;
+                }
+
+                ScanContainersForBadBase64(zdos);
+            });
+        }
+
+        public static Exception ConvertContainersFinalizer(Exception __exception)
+        {
+            SafeDiagnostic(() =>
+            {
+                InContainerConversion = false;
+
+                if (__exception != null)
+                {
+                    Write("=== ConvertContainers EXITED WITH EXCEPTION ===");
+                    Write("Exception:\n" + __exception);
+                }
+                else
+                {
+                    Write("=== LEGACY WORLD CONTAINER CONVERSION COMPLETED ===");
+                }
+            });
+
+            return __exception;
+        }
+
+        // Reports the exact string the game chokes on, in case the pre-scan does not flag it.
+        public static void ZPackageFromBase64Prefix(object[] __args)
+        {
+            if (!InContainerConversion) return;
+
+            SafeDiagnostic(() =>
+            {
+                string items = (__args != null && __args.Length > 0) ? __args[0] as string : null;
+                if (items == null) return;
+
+                string problem;
+                if (IsValidBase64(items, out problem)) return;
+
+                Write("!!! ZPackage(string) received an invalid Base-64 string !!!");
+                Write("  " + problem);
+                Write("  " + PreviewString(items));
+            });
+        }
+
+        private static void ScanContainersForBadBase64(IEnumerable zdos)
+        {
+            int total = 0;
+            int withItems = 0;
+            int bad = 0;
+
+            foreach (object zdo in zdos)
+            {
+                total++;
+                if (zdo == null) continue;
+
+                string items;
+                try
+                {
+                    items = _zdoGetStringByHash.Invoke(zdo, new object[] { ItemsHash, "" }) as string;
+                }
+                catch
+                {
+                    // A single unreadable ZDO must not stop the scan.
+                    continue;
+                }
+
+                if (string.IsNullOrEmpty(items)) continue;
+                withItems++;
+
+                string problem;
+                if (IsValidBase64(items, out problem)) continue;
+
+                bad++;
+                Write("---------------- MALFORMED CONTAINER REPORT ----------------");
+                Write("Source ZDO: " + DescribeZdo(zdo));
+                Write("Travel to it with: " + GotoHint(zdo));
+                Write("Problem: " + problem);
+                Write("Data: " + PreviewString(items));
+                Write("-----------------------------------------------------------");
+            }
+
+            Write($"Container pre-scan: {total} ZDOs checked, {withItems} with a non-empty \"items\" string, {bad} not valid Base-64.");
+
+            if (bad == 0)
+                Write("The pre-scan found no malformed container data.");
+        }
+
+        private static bool IsValidBase64(string value, out string problem)
+        {
+            try
+            {
+                Convert.FromBase64String(value);
+                problem = null;
+                return true;
+            }
+            catch (FormatException)
+            {
+                problem = DescribeBase64Problem(value);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                problem = ex.GetType().Name + ": " + ex.Message;
+                return false;
+            }
+        }
+
+        private static string DescribeBase64Problem(string value)
+        {
+            var sb = new StringBuilder();
+            sb.Append("not valid Base-64; length=").Append(value.Length);
+            sb.Append(", length%4=").Append(value.Length % 4);
+
+            int illegal = 0;
+            int firstIllegal = -1;
+            int whitespace = 0;
+
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                if (char.IsWhiteSpace(c)) whitespace++;
+
+                bool allowed = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                               || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
+                if (allowed) continue;
+
+                illegal++;
+                if (firstIllegal < 0) firstIllegal = i;
+            }
+
+            sb.Append(", illegalChars=").Append(illegal);
+            if (whitespace > 0) sb.Append(", whitespaceChars=").Append(whitespace);
+
+            if (firstIllegal >= 0)
+            {
+                sb.Append(", firstIllegalIndex=").Append(firstIllegal)
+                  .Append(" (U+").Append(((int)value[firstIllegal]).ToString("X4")).Append(")");
+            }
+
+            return sb.ToString();
+        }
+
+        private static string PreviewString(string value)
+        {
+            const int headLength = 80;
+            const int tailLength = 40;
+
+            if (value.Length <= headLength)
+                return "\"" + Escape(value) + "\"";
+
+            return "\"" + Escape(value.Substring(0, headLength)) + "\" ... \""
+                   + Escape(value.Substring(value.Length - tailLength)) + "\"";
+        }
+
+        private static string Escape(string value)
+        {
+            var sb = new StringBuilder(value.Length);
+
+            foreach (char c in value)
+            {
+                if (c >= 32 && c < 127) sb.Append(c);
+                else sb.Append("\\u").Append(((int)c).ToString("X4"));
+            }
+
+            return sb.ToString();
+        }
+
+        // The X and Z of the ZDO position, ready to paste into the console on the old build.
+        private static string GotoHint(object zdo)
+        {
+            try
+            {
+                object position = null;
+
+                if (_zdoGetPosition != null)
+                    position = _zdoGetPosition.Invoke(zdo, null);
+
+                if (position == null)
+                    position = GetMemberValue(zdo, "m_position");
+
+                if (position == null)
+                    return "<unknown position>";
+
+                var culture = System.Globalization.CultureInfo.InvariantCulture;
+                double x = Convert.ToDouble(GetMemberValue(position, "x"), culture);
+                double z = Convert.ToDouble(GetMemberValue(position, "z"), culture);
+
+                return "goto " + Math.Round(x).ToString("0", culture) + " " + Math.Round(z).ToString("0", culture);
+            }
+            catch (Exception ex)
+            {
+                return "<could not format a goto hint: " + ex.Message + ">";
+            }
         }
 
         public static void InventoryLoadOldPrefix(object __instance, MethodBase __originalMethod, object[] __args)
